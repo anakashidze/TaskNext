@@ -1,0 +1,44 @@
+name: One-time sync TaskNext v2 source
+
+on:
+  push:
+    branches:
+      - "chatgpt/v2-development"
+    paths:
+      - ".github/workflows/sync-v2-source.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out development branch
+        uses: actions/checkout@v6
+        with:
+          ref: chatgpt/v2-development
+          fetch-depth: 0
+
+      - name: Restore exact v2 source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .sync/source.part1 .sync/source.part2 .sync/source.part3 .sync/source.part4 .sync/source.part5             | base64 --decode > /tmp/tasknext-v2.tgz
+          tar -xzf /tmp/tasknext-v2.tgz -C TaskNext
+          rm -rf .sync
+          rm -f .github/workflows/sync-v2-source.yml
+
+      - name: Commit synchronized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "TaskNext Build Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A TaskNext .github/workflows
+          if git diff --cached --quiet; then
+            echo "Source already synchronized."
+            exit 0
+          fi
+          git commit -m "Sync TaskNext v2.0.0-alpha1 source"
+          git push origin HEAD:chatgpt/v2-development
