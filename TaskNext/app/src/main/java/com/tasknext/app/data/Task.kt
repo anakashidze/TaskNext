@@ -1,29 +1,27 @@
 package com.tasknext.app.data
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
 enum class Priority { LOW, MEDIUM, HIGH }
+enum class TaskSize { BIG, SMALL }
 
-/**
- * A task in the backlog pool.
- * - orderIndex: position in the "up next" queue (lower = sooner).
- * - slot: null if sitting in the pool; 0/1/2 if currently one of today's active tasks.
- *   Slot 0 is always the "primary" one — only completing the highest occupied slot
- *   triggers the next-task suggestion, per the app's flow.
- * - reminderHour/Minute: null means "use the global default from Settings".
- */
 @Entity(tableName = "tasks")
 data class Task(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val title: String,
     val colorHex: String = "#4F46E5",
+    @ColumnInfo(name = "colorName") val groupName: String = "Task",
+    val groupIcon: String = "task",
     val priority: Priority = Priority.MEDIUM,
+    @ColumnInfo(defaultValue = "'BIG'") val taskSize: TaskSize = TaskSize.BIG,
     val comment: String = "",
     val reminderHour: Int? = null,
     val reminderMinute: Int? = null,
-    val reminderEnabled: Boolean = false,
+    val reminderEnabled: Boolean = true,
     val orderIndex: Int = 0,
     val slot: Int? = null,
+    val overdueSinceEpochDay: Long? = null,
     val isArchived: Boolean = false
 )
