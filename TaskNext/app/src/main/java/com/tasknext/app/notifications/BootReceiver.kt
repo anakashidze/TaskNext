@@ -3,16 +3,35 @@ package com.tasknext.app.notifications
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import com.tasknext.app.data.AppDatabase
+import com.tasknext.app.data.SettingsStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
-/**
- * Exact alarms are cleared on reboot. This receiver exists so the manifest
- * registration is valid; actual rescheduling happens in MainActivity.onCreate,
- * which re-registers all enabled reminders from the database every time the
- * app is opened. For a production app you'd move that rescheduling logic here
- * instead, reading directly from Room.
- */
+/** Rebuilds reminder alarms after reboot, app update, or clock/time-zone changes. */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        // No-op by design; see MainActivity for reschedule-on-launch logic.
+        val pendingResult = goAsync()
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val settings = SettingsStore(context)
+                val tasks = AppDatabase.getInstance(context).taskDao().getAllOnce()
+                tasks.forEach { task ->
+                    if (task.slot != null && task.reminderEnabled && settings.notificationsEnabled) {
+                        NotificationScheduler.schedule(
+                            context,
+                            task,
+                            settings.defaultReminderHour,
+                            settings.defaultReminderMinute
+                        )
+                    } else {
+                        NotificationScheduler.cancel(context, task.id)
+                    }
+                }
+            } finally {
+                pendingResult.finish()
+            }
+        }
     }
 }
