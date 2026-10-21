@@ -1,84 +1,392 @@
 package com.tasknext.app.ui
 
-import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.activity.compose.BackHandler
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tasknext.app.data.Task
 import com.tasknext.app.viewmodel.TaskViewModel
-import java.text.SimpleDateFormat
-import java.util.*
+import kotlinx.coroutines.launch
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import kotlin.math.abs
+
+private enum class HubPage(val index: Int) {
+    TASKS(0), HOME(1), HISTORY(2)
+}
+
+private enum class HubGesture { LEFT, RIGHT, DOWN }
 
 /**
- * "One Thing"-style layout: one giant task fills almost the whole screen,
- * nearly no chrome, a single accent color, one big tap-to-complete action.
- * Secondary nav (list/settings) is reduced to two small icons that fade
- * into the background instead of a normal toolbar/bottom bar.
+ * One persistent three-page surface (Tasks <-> Home <-> History).
+ * Pages never get recreated during a horizontal gesture, so the finger tracking,
+ * release settle, and final page are one continuous motion with no route flash.
  */
 @Composable
 fun HomeScreen(
     viewModel: TaskViewModel,
-    onOpenList: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val mandatory by viewModel.mandatoryTask.collectAsState()
     val bonusTasks by viewModel.bonusTasks.collectAsState()
     val dayComplete by viewModel.dayComplete.collectAsState()
+    val streakCount by viewModel.streakCount.collectAsState()
     val showTomorrowPicker by viewModel.showTomorrowPicker.collectAsState()
     val pool by viewModel.pool.collectAsState()
+    val taskGroups by viewModel.taskGroups.collectAsState()
 
-    val accent = remember(mandatory?.colorHex) {
-        mandatory?.colorHex?.let {
-            try { Color(android.graphics.Color.parseColor(it)) } catch (e: Exception) { null }
-        } ?: Color(0xFF22C55E)
+    var currentPage by remember { mutableStateOf(HubPage.HOME) }
+    var screenSize by remember { mutableStateOf(IntSize.Zero) }
+    var dragOffsetX by remember { mutableFloatStateOf(0f) }
+    var pullOffset by remember { mutableFloatStateOf(0f) }
+    var settling by remember { mutableStateOf(false) }
+    var showAdd by remember { mutableStateOf(false) }
+
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    val directionLockPx = with(density) { 10.dp.toPx() }
+    val swipeThresholdPx = with(density) { 36.dp.toPx() }
+    val pullToAddThresholdPx = with(density) { 84.dp.toPx() }
+    val widthPx = screenSize.width.toFloat().coerceAtLeast(1f)
+    val pullProgress = (pullOffset / pullToAddThresholdPx).coerceIn(0f, 1f)
+
+    fun targetForHorizontal(totalX: Float): HubPage? = when (currentPage) {
+        HubPage.HOME -> when {
+            totalX < 0f -> HubPage.HISTORY
+            totalX > 0f -> HubPage.TASKS
+            else -> null
+        }
+        HubPage.HISTORY -> if (totalX > 0f) HubPage.HOME else null
+        HubPage.TASKS -> if (totalX < 0f) HubPage.HOME else null
     }
-    val bgTint by animateFloatAsState(if (dayComplete) 0.14f else 0.06f, tween(500), label = "bg")
+
+    fun settleToPage(target: HubPage, initialOffset: Float = dragOffsetX) {
+        if (settling || target == currentPage) return
+        settling = true
+        scope.launch {
+            val targetOffset = (currentPage.index - target.index) * widthPx
+            animate(
+                initialValue = initialOffset,
+                targetValue = targetOffset,
+                animationSpec = tween(150)
+            ) { value, _ -> dragOffsetX = value }
+            currentPage = target
+            dragOffsetX = 0f
+            settling = false
+        }
+    }
+
+    fun cancelHorizontal(initialOffset: Float = dragOffsetX) {
+        if (settling) return
+        settling = true
+        scope.launch {
+            animate(
+                initialValue = initialOffset,
+                targetValue = 0f,
+                animationSpec = tween(135)
+            ) { value, _ -> dragOffsetX = value }
+            dragOffsetX = 0f
+            settling = false
+        }
+    }
+
+    BackHandler(enabled = currentPage != HubPage.HOME && !settling) {
+        settleToPage(HubPage.HOME, 0f)
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .onSizeChanged { screenSize = it }
+            .then(
+                if (!settling) {
+                    Modifier.pointerInput(
+                        currentPage,
+                        screenSize,
+                        directionLockPx,
+                        swipeThresholdPx,
+                        pullToAddThresholdPx
+                    ) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            var totalX = 0f
+                            var totalY = 0f
+                            var gesture: HubGesture? = null
+                            var horizontalTarget: HubPage? = null
+                            var pullHapticSent = false
+                            dragOffsetX = 0f
+                            pullOffset = 0f
+
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Final)
+                                val change = event.changes.firstOrNull() ?: break
+                                if (!change.pressed) break
+
+                                // A task card owns its own horizontal swipe/drag. The page
+                                // gesture only starts when child content has not consumed it.
+                                if (gesture == null && change.isConsumed) continue
+
+                                val delta = change.position - change.previousPosition
+                                totalX += delta.x
+                                totalY += delta.y
+
+                                if (gesture == null) {
+                                    val horizontalEnough = abs(totalX) >= directionLockPx &&
+                                        abs(totalX) > abs(totalY) * 1.12f
+                                    val downwardEnough = currentPage == HubPage.HOME &&
+                                        totalY >= directionLockPx &&
+                                        abs(totalY) > abs(totalX) * 1.12f
+
+                                    if (horizontalEnough) {
+                                        val target = targetForHorizontal(totalX)
+                                        if (target != null) {
+                                            horizontalTarget = target
+                                            gesture = if (totalX < 0f) HubGesture.LEFT else HubGesture.RIGHT
+                                        }
+                                    } else if (downwardEnough) {
+                                        gesture = HubGesture.DOWN
+                                    }
+                                }
+
+                                when (gesture) {
+                                    HubGesture.LEFT, HubGesture.RIGHT -> {
+                                        val target = horizontalTarget
+                                        if (target != null) {
+                                            val targetOffset = (currentPage.index - target.index) * widthPx
+                                            dragOffsetX = if (targetOffset < 0f) {
+                                                totalX.coerceIn(targetOffset, 0f)
+                                            } else {
+                                                totalX.coerceIn(0f, targetOffset)
+                                            }
+                                            change.consume()
+                                        }
+                                    }
+                                    HubGesture.DOWN -> {
+                                        val pulled = totalY.coerceAtLeast(0f)
+                                            .coerceAtMost(pullToAddThresholdPx * 1.18f)
+                                        pullOffset = pulled
+                                        if (pulled >= pullToAddThresholdPx && !pullHapticSent) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            pullHapticSent = true
+                                        }
+                                        change.consume()
+                                    }
+                                    null -> Unit
+                                }
+                            }
+
+                            when (gesture) {
+                                HubGesture.LEFT, HubGesture.RIGHT -> {
+                                    val target = horizontalTarget
+                                    if (target != null) {
+                                        val commit = abs(dragOffsetX) >= widthPx / 2f ||
+                                            abs(dragOffsetX) >= swipeThresholdPx
+                                        if (commit) settleToPage(target, dragOffsetX)
+                                        else cancelHorizontal(dragOffsetX)
+                                    }
+                                }
+                                HubGesture.DOWN -> {
+                                    val armed = pullOffset >= pullToAddThresholdPx
+                                    pullOffset = 0f
+                                    if (armed) showAdd = true
+                                }
+                                null -> Unit
+                            }
+                        }
+                    }
+                } else Modifier
+            )
+    ) {
+        HubPage.entries.forEach { page ->
+            val translation = (page.index - currentPage.index) * widthPx + dragOffsetX
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { translationX = translation }
+            ) {
+                when (page) {
+                    HubPage.TASKS -> TaskListScreen(
+                        viewModel = viewModel,
+                        onBack = { settleToPage(HubPage.HOME, 0f) }
+                    )
+                    HubPage.HISTORY -> HistoryScreen(
+                        viewModel = viewModel,
+                        onBack = { settleToPage(HubPage.HOME, 0f) }
+                    )
+                    HubPage.HOME -> HomePageContent(
+                        mandatory = mandatory,
+                        bonusTasks = bonusTasks,
+                        dayComplete = dayComplete,
+                        streakCount = streakCount,
+                        onCompleteMandatory = { viewModel.completeMandatory(it) },
+                        onCompleteBonus = { viewModel.completeBonus(it) },
+                        onOpenTasks = { settleToPage(HubPage.TASKS, 0f) },
+                        onOpenSettings = onOpenSettings
+                    )
+                }
+            }
+        }
+
+        if (currentPage == HubPage.HOME && pullProgress > 0f) {
+            PullToAddIndicator(
+                progress = pullProgress,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 8.dp)
+            )
+        }
+    }
+
+    if (showAdd) {
+        AddEditTaskDialog(
+            existing = null,
+            availableGroups = taskGroups,
+            defaultReminderHour = viewModel.settings.defaultReminderHour,
+            defaultReminderMinute = viewModel.settings.defaultReminderMinute,
+            onAddGroup = { viewModel.addCustomGroup(it) },
+            onRemoveGroup = { viewModel.removeCustomGroup(it) },
+            onDismiss = { showAdd = false },
+            onSave = { title, group, priority, comment, remOn, h, m ->
+                viewModel.addTask(
+                    title = title,
+                    colorHex = group.colorHex,
+                    groupName = group.name,
+                    groupIcon = group.iconKey,
+                    priority = priority,
+                    comment = comment,
+                    reminderEnabled = remOn,
+                    hour = h,
+                    minute = m
+                )
+                showAdd = false
+            }
+        )
+    }
+
+    if (showTomorrowPicker) {
+        TomorrowPickerDialog(
+            pool = pool,
+            onPick = { viewModel.setTomorrowTask(it) },
+            onDismiss = { viewModel.dismissTomorrowPicker() }
+        )
+    }
+}
+
+@Composable
+private fun HomePageContent(
+    mandatory: Task?,
+    bonusTasks: List<Task>,
+    dayComplete: Boolean,
+    streakCount: Int,
+    onCompleteMandatory: (Long) -> Unit,
+    onCompleteBonus: (Long) -> Unit,
+    onOpenTasks: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    val accent = remember(mandatory?.colorHex) {
+        mandatory?.colorHex?.let {
+            try { Color(android.graphics.Color.parseColor(it)) } catch (_: Exception) { null }
+        } ?: Color(0xFF22C55E)
+    }
+    val bgTint by animateFloatAsState(
+        targetValue = if (dayComplete) 0.14f else 0.06f,
+        animationSpec = tween(350),
+        label = "home-bg"
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
             .background(accent.copy(alpha = bgTint))
     ) {
-        Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
-
-            // Minimal top row: date only, no title bar.
-            Text(
-                SimpleDateFormat("EEEE, MMM d", Locale.getDefault()).format(Date()),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .safeDrawingPadding()
+                .padding(24.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    DateTimeFormatter.ofPattern("EEEE, MMM d", Locale.getDefault()).format(LocalDate.now()),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        "Streak",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.LocalFireDepartment,
+                            contentDescription = null,
+                            tint = Color(0xFFFF7A2F),
+                            modifier = Modifier.size(17.dp)
+                        )
+                        Text(
+                            if (streakCount == 1) "1 day" else "$streakCount days",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
 
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                AnimatedVisibility(dayComplete, enter = fadeIn(), exit = fadeOut()) {
-                    DayCompleteHero(accent)
-                }
-                AnimatedVisibility(!dayComplete && mandatory != null, enter = fadeIn(), exit = fadeOut()) {
-                    mandatory?.let { OneThingHero(task = it, accent = accent, onDone = { viewModel.completeMandatory(it.id) }) }
-                }
-                if (!dayComplete && mandatory == null) {
-                    Text(
+                when {
+                    dayComplete -> DayCompleteHero(accent)
+                    mandatory != null -> OneThingHero(
+                        task = mandatory,
+                        accent = accent,
+                        onDone = { onCompleteMandatory(mandatory.id) }
+                    )
+                    else -> Text(
                         "Nothing set for today.\nAdd one thing.",
                         style = MaterialTheme.typography.headlineSmall,
                         textAlign = TextAlign.Center,
@@ -89,46 +397,81 @@ fun HomeScreen(
 
             if (bonusTasks.isNotEmpty()) {
                 Text(
-                    "also today",
+                    "Also today",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(6.dp))
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.heightIn(max = 140.dp)) {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.heightIn(max = 140.dp)
+                ) {
                     items(bonusTasks, key = { it.id }) { task ->
-                        BonusTaskRow(task = task, onDone = { viewModel.completeBonus(task.id) })
+                        BonusTaskRow(task = task, onDone = { onCompleteBonus(task.id) })
                     }
                 }
                 Spacer(Modifier.height(12.dp))
             }
 
-            // Two quiet icons instead of a toolbar — tucked at the very bottom.
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                IconButton(onClick = onOpenList) {
+                IconButton(onClick = onOpenTasks) {
                     Icon(
-                        Icons.Default.List, contentDescription = "Task list",
+                        Icons.Default.List,
+                        contentDescription = "Task list",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 IconButton(onClick = onOpenSettings) {
                     Icon(
-                        Icons.Default.Settings, contentDescription = "Settings",
+                        Icons.Default.Settings,
+                        contentDescription = "Settings",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
         }
     }
+}
 
-    if (showTomorrowPicker) {
-        TomorrowPickerDialog(
-            pool = pool,
-            onPick = { viewModel.setTomorrowTask(it) },
-            onDismiss = { viewModel.dismissTomorrowPicker() }
-        )
+@Composable
+private fun PullToAddIndicator(progress: Float, modifier: Modifier = Modifier) {
+    val armed = progress >= 1f
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+        shadowElevation = 4.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(modifier = Modifier.size(30.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(
+                    progress = progress.coerceIn(0f, 1f),
+                    modifier = Modifier.fillMaxSize(),
+                    strokeWidth = 3.dp
+                )
+                Icon(
+                    imageVector = if (armed) Icons.Default.Check else Icons.Default.Add,
+                    contentDescription = null,
+                    modifier = Modifier.size(17.dp),
+                    tint = if (armed) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Text(
+                text = if (armed) "Release to add task" else "Pull to add task",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = if (armed) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (armed) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 
@@ -186,7 +529,7 @@ private fun DayCompleteHero(accent: Color) {
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            "Nothing more needed today.",
+            "Your one thing is done for today.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
